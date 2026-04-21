@@ -351,6 +351,37 @@ export function usePing() {
 }
 
 /**
+ * 执行模型综合评估
+ */
+export function useEvaluation() {
+  const [loading, setLoading] = useState(false);
+  const [evaluatingId, setEvaluatingId] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const evaluateModel = useCallback(async (modelId: number) => {
+    setLoading(true);
+    setEvaluatingId(modelId);
+    setError(null);
+    try {
+      const result = await fetchApi<{ data: unknown }>('/evaluations', {
+        method: 'POST',
+        body: JSON.stringify({ model_id: modelId }),
+      });
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to run evaluation';
+      setError(message);
+      throw err;
+    } finally {
+      setLoading(false);
+      setEvaluatingId(null);
+    }
+  }, []);
+
+  return { evaluateModel, loading, evaluatingId, error };
+}
+
+/**
  * 获取监控状态
  */
 export function useStatus() {

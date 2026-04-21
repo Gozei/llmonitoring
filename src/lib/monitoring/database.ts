@@ -3,10 +3,31 @@
  */
 
 import { getSqliteClient } from '@/storage/database/sqlite-client';
-import type { Platform, InsertPlatform, Model, InsertModel, PingRecord, InsertPingRecord } from '@/storage/database/shared/schema';
+import type {
+  EvaluationCaseSummary,
+  EvaluationRecord,
+  EvaluationScore,
+  Platform,
+  InsertPlatform,
+  Model,
+  InsertModel,
+  PingRecord,
+  InsertPingRecord,
+} from '@/storage/database/shared/schema';
 
 type SqlValue = string | number | null;
 type Row = Record<string, unknown>;
+
+const EVALUATION_CASE_POLICY = {
+  connectivity_check: { timeout: 30, latencyField: 'avg_latency_s' },
+  identity_check: { timeout: 30, latencyField: 'avg_latency_s' },
+  json_check: { timeout: 30, latencyField: 'avg_latency_s' },
+  code_check: { timeout: 60, latencyField: 'avg_latency_s' },
+  reasoning_check: { timeout: 180, latencyField: 'avg_total_time_s' },
+  consistency_check: { timeout: 45, latencyField: 'avg_latency_s' },
+} as const;
+
+const EVALUATION_CASE_ORDER = Object.keys(EVALUATION_CASE_POLICY) as Array<keyof typeof EVALUATION_CASE_POLICY>;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -52,6 +73,55 @@ function normalizePingRecord(row: Row): PingRecord {
     request_params: fromJson(row.request_params),
     response_data: fromJson(row.response_data),
   } as PingRecord;
+}
+
+function deriveEvaluationAvgLatencyMs(summary: EvaluationCaseSummary[]): number | null {
+  if (EVALUATION_CASE_ORDER.length === 0) return null;
+
+  const byCase = new Map(summary.map(item => [item.case, item]));
+  const total = EVALUATION_CASE_ORDER.reduce((sum, caseName) => {
+    const policy = EVALUATION_CASE_POLICY[caseName];
+    const item = byCase.get(caseName);
+    const value = item?.[policy.latencyField];
+    const latencySeconds = typeof value === 'number' ? value : policy.timeout;
+    return sum + latencySeconds * 1000;
+  }, 0);
+
+  return Math.round(total / EVALUATION_CASE_ORDER.length);
+}
+
+function normalizeEvaluationRecord(row: Row): EvaluationRecord {
+  const summary = ((fromJson(row.summary) ?? []) as EvaluationCaseSummary[]).map(item => ({
+    ...item,
+    score: typeof item.score === 'number' ? item.score : Math.round(item.success_rate * 100),
+    metrics: Array.isArray(item.metrics) ? item.metrics : [],
+    avg_ttft_s: typeof item.avg_ttft_s === 'number' ? item.avg_ttft_s : null,
+    avg_total_time_s: typeof item.avg_total_time_s === 'number' ? item.avg_total_time_s : null,
+  }));
+  const inferredRawScore = EVALUATION_CASE_ORDER.length > 0
+    ? Math.round(EVALUATION_CASE_ORDER.reduce((sum, caseName) => {
+      const item = summary.find(entry => entry.case === caseName);
+      return sum + (item?.score ?? 0);
+    }, 0) / EVALUATION_CASE_ORDER.length)
+    : 0;
+  const derivedAvgLatencyMs = deriveEvaluationAvgLatencyMs(summary);
+  const storedScore = typeof row.score === 'number' ? row.score : inferredRawScore;
+  const inferredPenalty = Math.max(0, Number((inferredRawScore - storedScore).toFixed(1)));
+  const evaluationComplete = typeof row.evaluation_complete === 'number'
+    ? toBool(row.evaluation_complete)
+    : EVALUATION_CASE_ORDER.every(caseName => summary.some(item => item.case === caseName));
+
+  return {
+    ...row,
+    raw_score: typeof row.raw_score === 'number' ? row.raw_score : inferredRawScore,
+    latency_penalty: typeof row.latency_penalty === 'number' ? row.latency_penalty : inferredPenalty,
+    evaluation_complete: evaluationComplete,
+    notes: (fromJson(row.notes) ?? []) as string[],
+    risks: (fromJson(row.risks) ?? []) as string[],
+    summary,
+    raw_logs: (fromJson(row.raw_logs) ?? {}) as Record<string, unknown>,
+    avg_latency_ms: typeof row.avg_latency_ms === 'number' ? row.avg_latency_ms : derivedAvgLatencyMs,
+  } as EvaluationRecord;
 }
 
 function platformParams(platform: InsertPlatform): Record<string, SqlValue> {
@@ -333,6 +403,16 @@ export async function getAllModelsWithPlatforms(): Promise<Array<Model & { platf
   });
 }
 
+export async function getModelWithPlatformById(id: number): Promise<(Model & { platform: Platform }) | null> {
+  const model = getModelByIdSync(id);
+  if (!model) return null;
+
+  const platform = getPlatformByIdSync(model.platform_id);
+  if (!platform) return null;
+
+  return { ...model, platform };
+}
+
 /**
  * 创建模型
  */
@@ -422,6 +502,82 @@ export async function insertPingRecord(record: InsertPingRecord): Promise<PingRe
   return normalizePingRecord(row);
 }
 
+export async function insertEvaluationRecord(record: {
+  model_id: number;
+  platform_id: number;
+  final_score: EvaluationScore;
+  summary: EvaluationCaseSummary[];
+  raw_logs: Record<string, unknown>;
+}): Promise<EvaluationRecord> {
+  const totalCalls = record.summary.reduce((sum, item) => sum + item.calls, 0);
+  const successCalls = record.summary.reduce((sum, item) => sum + item.success_calls, 0);
+  const timeoutCalls = record.summary.reduce((sum, item) => sum + item.timeout_calls, 0);
+
+  const info = getSqliteClient()
+    .prepare(`
+      INSERT INTO evaluation_records (
+        model_id, platform_id, score, level, notes, risks, summary, raw_logs,
+        total_calls, success_rate, avg_latency_ms, timeout_rate,
+        raw_score, latency_penalty, evaluation_complete
+      )
+      VALUES (
+        @model_id, @platform_id, @score, @level, @notes, @risks, @summary, @raw_logs,
+        @total_calls, @success_rate, @avg_latency_ms, @timeout_rate,
+        @raw_score, @latency_penalty, @evaluation_complete
+      )
+    `)
+    .run({
+      model_id: record.model_id,
+      platform_id: record.platform_id,
+      score: record.final_score.score,
+      raw_score: record.final_score.raw_score,
+      latency_penalty: record.final_score.latency_penalty,
+      evaluation_complete: record.final_score.evaluation_complete ? 1 : 0,
+      level: record.final_score.level,
+      notes: toJson(record.final_score.notes),
+      risks: toJson(record.final_score.risks),
+      summary: toJson(record.summary),
+      raw_logs: toJson(record.raw_logs),
+      total_calls: totalCalls,
+      success_rate: totalCalls > 0 ? successCalls / totalCalls : 0,
+      avg_latency_ms: record.final_score.avg_latency_ms ?? deriveEvaluationAvgLatencyMs(record.summary),
+      timeout_rate: totalCalls > 0 ? timeoutCalls / totalCalls : 0,
+    });
+
+  const row = getSqliteClient()
+    .prepare('SELECT * FROM evaluation_records WHERE id = ?')
+    .get(Number(info.lastInsertRowid)) as Row;
+
+  return normalizeEvaluationRecord(row);
+}
+
+export async function getLatestEvaluationByModel(modelId: number): Promise<EvaluationRecord | null> {
+  const row = getSqliteClient()
+    .prepare('SELECT * FROM evaluation_records WHERE model_id = ? ORDER BY created_at DESC, id DESC LIMIT 1')
+    .get(modelId) as Row | undefined;
+
+  return row ? normalizeEvaluationRecord(row) : null;
+}
+
+export async function getLatestEvaluationsByModels(): Promise<Map<number, EvaluationRecord>> {
+  const rows = getSqliteClient()
+    .prepare(`
+      SELECT er.*
+      FROM evaluation_records er
+      INNER JOIN (
+        SELECT model_id, MAX(id) AS id
+        FROM evaluation_records
+        GROUP BY model_id
+      ) latest ON latest.id = er.id
+    `)
+    .all() as Row[];
+
+  return new Map(rows.map(row => {
+    const evaluation = normalizeEvaluationRecord(row);
+    return [evaluation.model_id, evaluation];
+  }));
+}
+
 /**
  * 获取模型的最新延迟记录
  */
@@ -493,6 +649,7 @@ export async function getAllModelsStatus(hours: number = 24): Promise<Array<{
   model: Model;
   platform: Platform;
   latest: PingRecord | null;
+  evaluation: EvaluationRecord | null;
   stats: {
     avg_latency_ms: number;
     min_latency_ms: number;
@@ -504,6 +661,7 @@ export async function getAllModelsStatus(hours: number = 24): Promise<Array<{
   };
 }>> {
   const modelsWithPlatforms = await getAllModelsWithPlatforms();
+  const evaluations = await getLatestEvaluationsByModels();
 
   const results = await Promise.all(
     modelsWithPlatforms.map(async (model) => {
@@ -515,6 +673,7 @@ export async function getAllModelsStatus(hours: number = 24): Promise<Array<{
         model,
         platform: model.platform,
         latest,
+        evaluation: evaluations.get(model.id) ?? null,
         stats,
       };
     })

@@ -5,11 +5,20 @@
 
 import {
   IPlatformAdapter,
+  ModelConfig,
   PlatformConfig,
   PingResult,
   DEFAULT_TEST_MESSAGE,
   DEFAULT_TIMEOUT_MS,
 } from './adapter';
+import {
+  buildProtocolHeaders,
+  buildProtocolPayload,
+  extractProtocolModel,
+  extractProtocolStreamText,
+  resolveProtocolEndpoint,
+  resolveProviderProtocol,
+} from './protocols';
 
 export class OpenAICompatibleAdapter implements IPlatformAdapter {
   readonly slug = 'openai-compatible';
@@ -23,7 +32,7 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
     const results: PingResult[] = [];
 
     for (const model of platformConfig.models) {
-      const result = await this.pingModel(platformConfig, model.model_id, model.name, signal);
+      const result = await this.pingModel(platformConfig, model, signal);
       results.push(result);
     }
 
@@ -32,42 +41,29 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
 
   private async pingModel(
     platformConfig: PlatformConfig,
-    modelId: string,
-    modelName: string,
+    model: ModelConfig,
     signal?: AbortSignal
   ): Promise<PingResult> {
     const startTime = Date.now();
     let ttft: number | null = null;
+    const protocol = resolveProviderProtocol(model.config);
+    const endpoint = resolveProtocolEndpoint(platformConfig.api_endpoint, protocol);
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
+      const headers = buildProtocolHeaders({
+        protocol,
+        apiKey: platformConfig.api_key || (platformConfig.config?.api_key as string | undefined),
+        extraHeaders: platformConfig.config?.extra_headers as Record<string, unknown> | undefined,
+        anthropicVersion: platformConfig.config?.anthropic_version as string | undefined,
+      });
 
-      // 支持多种认证方式
-      if (platformConfig.api_key) {
-        // Bearer Token
-        headers['Authorization'] = `Bearer ${platformConfig.api_key}`;
-      } else if (platformConfig.config?.api_key) {
-        headers['Authorization'] = `Bearer ${platformConfig.config.api_key}`;
-      }
-
-      // 支持自定义认证头
-      const authHeader = platformConfig.config?.auth_header as string;
-      if (authHeader && platformConfig.api_key) {
-        headers[authHeader] = platformConfig.api_key;
-      }
-
-      const requestBody: Record<string, unknown> = {
-        model: modelId,
-        messages: [{ role: 'user', content: DEFAULT_TEST_MESSAGE }],
+      const requestBody = buildProtocolPayload({
+        protocol,
+        modelId: model.model_id,
+        input: DEFAULT_TEST_MESSAGE,
         stream: true,
-      };
-
-      // 支持额外的请求参数
-      if (platformConfig.config?.extra_params) {
-        Object.assign(requestBody, platformConfig.config.extra_params);
-      }
+        extraParams: model.config?.extra_params as Record<string, unknown> | undefined,
+      });
 
       const controller = new AbortController();
       const timeout = setTimeout(
@@ -77,7 +73,7 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
 
       const fetchSignal = signal || controller.signal;
 
-      const response = await fetch(platformConfig.api_endpoint, {
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers,
         body: JSON.stringify(requestBody),
@@ -96,7 +92,7 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
           total_time_ms: Date.now() - startTime,
           status: 'error',
           error_message: `HTTP ${response.status}: ${errorText.slice(0, 200)}`,
-          request_params: { url: platformConfig.api_endpoint, model: modelId },
+          request_params: { url: endpoint, model: model.model_id, protocol },
         };
       }
 
@@ -111,13 +107,15 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
           total_time_ms: Date.now() - startTime,
           status: 'error',
           error_message: 'Response body is not readable',
-          request_params: { url: platformConfig.api_endpoint, model: modelId },
+          request_params: { url: endpoint, model: model.model_id, protocol },
         };
       }
 
       const decoder = new TextDecoder();
       let firstTokenReceived = false;
       let content = '';
+      let responseModel: string | null = null;
+      let buffer = '';
 
       try {
         while (true) {
@@ -127,25 +125,27 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
 
           const chunk = decoder.decode(value, { stream: true });
           content += chunk;
+          buffer += chunk;
 
-          // 解析 SSE 流
-          const lines = chunk.split('\n');
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
           for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6).trim();
-              if (data === '[DONE]') {
-                break;
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+
+            const data = trimmed.slice(5).trim();
+            if (!data || data === '[DONE]') continue;
+
+            try {
+              const parsed = JSON.parse(data) as Record<string, unknown>;
+              responseModel = responseModel ?? extractProtocolModel(parsed);
+              const chunkText = extractProtocolStreamText(parsed);
+              if (!firstTokenReceived && chunkText) {
+                ttft = Date.now() - startTime;
+                firstTokenReceived = true;
               }
-              try {
-                const parsed = JSON.parse(data);
-                // 捕获首 token 时间
-                if (!firstTokenReceived && parsed.choices?.[0]?.delta?.content) {
-                  ttft = Date.now() - startTime;
-                  firstTokenReceived = true;
-                }
-              } catch {
-                // 忽略解析错误
-              }
+            } catch {
+              // 忽略解析错误
             }
           }
         }
@@ -160,9 +160,10 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
         ttft_ms: ttft,
         total_time_ms: Date.now() - startTime,
         status: 'success',
-        request_params: { url: platformConfig.api_endpoint, model: modelId },
+        request_params: { url: endpoint, model: model.model_id, protocol },
         response_data: {
           content_length: content.length,
+          response_model: responseModel,
         },
       };
     } catch (error) {
@@ -178,7 +179,7 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
           total_time_ms: Date.now() - startTime,
           status: 'timeout',
           error_message: 'Request timeout',
-          request_params: { url: platformConfig.api_endpoint, model: modelId },
+          request_params: { url: endpoint, model: model.model_id, protocol },
         };
       }
 
@@ -190,7 +191,7 @@ export class OpenAICompatibleAdapter implements IPlatformAdapter {
         total_time_ms: Date.now() - startTime,
         status: 'error',
         error_message: errorMessage,
-        request_params: { url: platformConfig.api_endpoint, model: modelId },
+        request_params: { url: endpoint, model: model.model_id, protocol },
       };
     }
   }

@@ -13,10 +13,28 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
 import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
@@ -28,11 +46,11 @@ import {
   Edit2,
   Save,
   X,
-  Settings,
   Globe,
   Box,
   CheckCircle2,
   XCircle,
+  ChevronRight,
 } from 'lucide-react';
 import {
   useCreatePlatform,
@@ -42,16 +60,24 @@ import {
   useUpdateModel,
   useDeleteModel,
   useModels,
-  useAdapters,
   usePlatforms,
 } from './use-api';
 import type { Platform, Model } from './types';
+import {
+  DEFAULT_PROVIDER_PROTOCOL,
+  PROTOCOL_TEMPLATES,
+  resolveProtocolEndpoint,
+  resolveProviderProtocol,
+  type ProviderProtocol,
+  withProviderProtocol,
+} from '@/lib/monitoring/protocols';
 
 interface ModelFormData {
   id?: number;
   name: string;
   model_id: string;
   description: string;
+  protocol: ProviderProtocol;
   is_active: boolean;
   _isNew?: boolean;
   _isEditing?: boolean;
@@ -63,6 +89,24 @@ interface PlatformManagementDialogProps {
   platform?: Platform | null;
   onSuccess?: () => void;
   mode?: 'create' | 'edit';
+}
+
+function buildPlatformConfig(existingConfig: Record<string, unknown> | undefined) {
+  return {
+    ...(existingConfig || {}),
+    timeout: 60000,
+  };
+}
+
+function buildSupplierSlug(name: string, endpoint: string): string {
+  const base = (name || endpoint || 'supplier')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  return base || 'supplier';
 }
 
 export function PlatformManagementDialog({
@@ -95,6 +139,9 @@ export function PlatformManagementDialog({
   const [currentPlatformId, setCurrentPlatformId] = useState<number | null>(null);
   const [savingModels, setSavingModels] = useState<Set<number>>(new Set());
   const [deletingModelId, setDeletingModelId] = useState<number | null>(null);
+  const [confirmDeleteModel, setConfirmDeleteModel] = useState<ModelFormData | null>(null);
+  const [confirmDeletePlatformOpen, setConfirmDeletePlatformOpen] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
 
   // Hooks
   const { create, loading: creating } = useCreatePlatform();
@@ -104,19 +151,20 @@ export function PlatformManagementDialog({
   const { update: updateModel, loading: updatingModel } = useUpdateModel();
   const { remove: deleteModel, loading: deletingModel } = useDeleteModel();
   const { models: fetchedModels, fetch: fetchModels, loading: fetchingModels } = useModels();
-  const { adapters, fetch: fetchAdapters } = useAdapters();
   const { platforms, fetch: fetchPlatforms } = usePlatforms();
 
   const loading = creating || updating || deleting || creatingModel || updatingModel || deletingModel;
   const isModelLoading = fetchingModels || savingModels.size > 0 || deletingModelId !== null;
 
-  // 加载适配器列表和平台列表
+  // 加载平台列表
   useEffect(() => {
     if (open) {
-      fetchAdapters();
+      setMessage(null);
+      setConfirmDeleteModel(null);
+      setConfirmDeletePlatformOpen(false);
       fetchPlatforms();
     }
-  }, [open, fetchAdapters, fetchPlatforms]);
+  }, [open, fetchPlatforms]);
 
   // 初始化表单数据
   useEffect(() => {
@@ -139,6 +187,7 @@ export function PlatformManagementDialog({
             name: m.name,
             model_id: m.model_id,
             description: m.description || '',
+            protocol: resolveProviderProtocol(m.config),
             is_active: m.is_active,
           })) || []
         );
@@ -165,13 +214,14 @@ export function PlatformManagementDialog({
 
   // 同步模型数据
   useEffect(() => {
-    if (mode === 'edit' && fetchedModels && fetchedModels.length > 0) {
+    if (mode === 'edit' && fetchedModels) {
       setModels(
         (fetchedModels as Model[]).map((m) => ({
           id: m.id,
           name: m.name || '',
           model_id: m.model_id || '',
           description: m.description || '',
+          protocol: resolveProviderProtocol(m.config),
           is_active: m.is_active ?? true,
           _isNew: false,
           _isEditing: false,
@@ -180,37 +230,32 @@ export function PlatformManagementDialog({
     }
   }, [fetchedModels, mode]);
 
-  // 选择适配器
-  const handleAdapterSelect = (slug: string) => {
-    setPlatformData((prev) => ({ ...prev, slug }));
-    const adapter = adapters.find((a) => a.slug === slug);
-    if (adapter && adapter.defaultEndpoint) {
-      setPlatformData((prev) => ({ ...prev, api_endpoint: adapter.defaultEndpoint }));
-    }
-    // 进入 Tab 模式，默认显示平台配置
-    setStep('platform');
-    setActiveTab('platform');
-  };
-
-  // 自定义模式
-  const handleCustomPlatform = () => {
-    setPlatformData((prev) => ({
-      ...prev,
-      slug: 'openai-compatible',
-    }));
-    // 进入 Tab 模式，默认显示平台配置
+  // 选择首个模型协议模板
+  const handleProtocolTemplateSelect = (protocol: ProviderProtocol) => {
+    setModels([
+      {
+        name: '',
+        model_id: '',
+        description: '',
+        protocol,
+        is_active: true,
+        _isNew: true,
+        _isEditing: true,
+      },
+    ]);
     setStep('platform');
     setActiveTab('platform');
   };
 
   // 添加模型
-  const handleAddModel = () => {
+  const handleAddModel = (protocol: ProviderProtocol = DEFAULT_PROVIDER_PROTOCOL) => {
     setModels((prev) => [
       ...prev,
       {
         name: '',
         model_id: '',
         description: '',
+        protocol,
         is_active: true,
         _isNew: true,
         _isEditing: true,
@@ -243,6 +288,7 @@ export function PlatformManagementDialog({
                   name: original.name || '',
                   model_id: original.model_id || '',
                   description: original.description || '',
+                  protocol: resolveProviderProtocol(original.config),
                   is_active: original.is_active ?? true,
                   _isNew: false,
                   _isEditing: false,
@@ -268,17 +314,21 @@ export function PlatformManagementDialog({
       return;
     }
 
-    if (!confirm('确定要删除这个模型吗？')) return;
-
+    setMessage(null);
     setDeletingModelId(model.id);
     try {
       await deleteModel(model.id);
-      setModels((prev) => prev.filter((m) => m.id !== model.id));
+      if (currentPlatformId || platform?.id) {
+        await fetchModels(currentPlatformId || (platform?.id as number));
+      } else {
+        setModels((prev) => prev.filter((m) => m.id !== model.id));
+      }
       onSuccess?.();
     } catch (err) {
-      alert('删除失败: ' + (err instanceof Error ? err.message : '未知错误'));
+      setMessage('删除失败: ' + (err instanceof Error ? err.message : '未知错误'));
     } finally {
       setDeletingModelId(null);
+      setConfirmDeleteModel(null);
     }
   };
 
@@ -287,11 +337,13 @@ export function PlatformManagementDialog({
     if (!platform?.id && !currentPlatformId) return;
 
     if (!model.name.trim() || !model.model_id.trim()) {
-      alert('请输入模型名称和模型ID');
+      setMessage('请输入模型名称和模型ID');
       return;
     }
 
     const targetPlatformId = currentPlatformId || platform?.id;
+    const existingModel = (fetchedModels as Model[] | undefined)?.find((item) => item.id === model.id);
+    setMessage(null);
     setSavingModels((prev) => new Set([...prev, model.id || index]));
 
     try {
@@ -300,6 +352,7 @@ export function PlatformManagementDialog({
           name: model.name,
           model_id: model.model_id,
           description: model.description,
+          config: withProviderProtocol(existingModel?.config, model.protocol),
           is_active: model.is_active,
         });
       } else {
@@ -308,6 +361,7 @@ export function PlatformManagementDialog({
           name: model.name,
           model_id: model.model_id,
           description: model.description,
+          config: withProviderProtocol(undefined, model.protocol),
           is_active: model.is_active,
         });
       }
@@ -317,7 +371,7 @@ export function PlatformManagementDialog({
       }
       onSuccess?.();
     } catch (err) {
-      alert('保存失败: ' + (err instanceof Error ? err.message : '未知错误'));
+      setMessage('保存失败: ' + (err instanceof Error ? err.message : '未知错误'));
     } finally {
       setSavingModels((prev) => {
         const next = new Set(prev);
@@ -354,24 +408,24 @@ export function PlatformManagementDialog({
     try {
       // 验证平台信息
       if (!platformData.name || !platformData.name.trim()) {
-        alert('请填写平台名称');
+        setMessage('请填写供应商名称');
         return;
       }
       if (!platformData.api_endpoint || !platformData.api_endpoint.trim()) {
-        alert('请填写 API 端点');
+        setMessage('请填写供应商端点');
         return;
       }
 
       // 验证：必须至少有一个模型
       if (models.length === 0) {
-        alert('请至少添加一个模型');
+        setMessage('请至少添加一个模型');
         return;
       }
 
       // 验证：每个模型必须填写名称和模型ID
       const invalidModel = models.find((m) => !m.name.trim() || !m.model_id.trim());
       if (invalidModel) {
-        alert(`模型 "${invalidModel.name || '未命名'}" 缺少名称或模型ID，请完善后再保存`);
+        setMessage(`模型 "${invalidModel.name || '未命名'}" 缺少名称或模型ID，请完善后再保存`);
         return;
       }
 
@@ -382,21 +436,25 @@ export function PlatformManagementDialog({
         // 更新已有平台
         await update(platform.id, {
           ...platformData,
-          config: { timeout: 60000 },
+          config: buildPlatformConfig(platform.config as Record<string, unknown> | undefined),
         });
         onSuccess?.();
         onOpenChange(false);
       } else {
-        // 创建新平台
-        // 检查 slug 是否重复
-        if ((platforms as Platform[]).some((p) => p.slug === platformData.slug)) {
-          alert(`标识符 "${platformData.slug}" 已被其他平台使用，请使用其他名称`);
-          return;
+        const existingSlugs = new Set((platforms as Platform[]).map((p) => p.slug));
+        const baseSlug = buildSupplierSlug(platformData.name, platformData.api_endpoint);
+        let candidateSlug = baseSlug;
+        let counter = 2;
+
+        while (existingSlugs.has(candidateSlug)) {
+          candidateSlug = `${baseSlug}-${counter}`;
+          counter += 1;
         }
 
         const result = await create({
           ...platformData,
-          config: { timeout: 60000 },
+          slug: candidateSlug,
+          config: buildPlatformConfig(undefined),
         });
 
         if (result.data) {
@@ -411,6 +469,7 @@ export function PlatformManagementDialog({
                 name: model.name,
                 model_id: model.model_id,
                 description: model.description,
+                config: withProviderProtocol(undefined, model.protocol),
                 is_active: model.is_active,
               });
             }
@@ -421,7 +480,7 @@ export function PlatformManagementDialog({
         }
       }
     } catch (error) {
-      alert('保存失败: ' + (error instanceof Error ? error.message : '未知错误'));
+      setMessage('保存失败: ' + (error instanceof Error ? error.message : '未知错误'));
     }
   };
 
@@ -438,6 +497,7 @@ export function PlatformManagementDialog({
               name: model.name,
               model_id: model.model_id,
               description: model.description,
+              config: withProviderProtocol(undefined, model.protocol),
               is_active: model.is_active,
             });
           }
@@ -445,7 +505,7 @@ export function PlatformManagementDialog({
         onSuccess?.();
         onOpenChange(false);
       } catch (error) {
-        alert('保存失败: ' + (error instanceof Error ? error.message : '未知错误'));
+        setMessage('保存失败: ' + (error instanceof Error ? error.message : '未知错误'));
       }
     } else {
       onOpenChange(false);
@@ -454,7 +514,7 @@ export function PlatformManagementDialog({
 
   // 删除平台
   const handleDelete = async () => {
-    if (!platform || !confirm('确定要删除该平台吗？这将同时删除所有模型和监控记录。')) {
+    if (!platform) {
       return;
     }
 
@@ -463,65 +523,57 @@ export function PlatformManagementDialog({
       onSuccess?.();
       onOpenChange(false);
     } catch (error) {
-      alert('删除失败: ' + (error instanceof Error ? error.message : '未知错误'));
+      setMessage('删除失败: ' + (error instanceof Error ? error.message : '未知错误'));
+    } finally {
+      setConfirmDeletePlatformOpen(false);
     }
   };
 
   // ========== 渲染函数 ==========
 
-  // 步骤1：选择适配器模板
+  // 步骤1：选择协议模板
   const renderSelectStep = () => (
     <div className="space-y-6 py-4">
       <div className="space-y-2">
-        <Label className="text-base font-medium">选择适配器模板</Label>
+        <Label className="text-base font-medium">选择首个模型协议模板</Label>
         <p className="text-sm text-muted-foreground">
-          选择一个预设模板可以自动填充 API 端点，也可以选择自定义模式手动配置
+          先选一个常用协议，后续每个模型都可以单独修改。
         </p>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        {adapters.map((adapter) => (
-          <Card
-            key={adapter.slug}
-            className="cursor-pointer hover:border-primary transition-colors"
-            onClick={() => handleAdapterSelect(adapter.slug)}
+      <RadioGroup
+        value={models[0]?.protocol}
+        onValueChange={(value) => handleProtocolTemplateSelect(value as ProviderProtocol)}
+        className="gap-2"
+      >
+        {PROTOCOL_TEMPLATES.map((template) => (
+          <label
+            key={template.protocol}
+            className="flex cursor-pointer items-start gap-3 rounded-lg border px-4 py-3 transition-colors hover:border-primary"
           >
-            <CardContent className="p-4">
-              <div className="font-medium">{adapter.name}</div>
-              <div className="text-xs text-muted-foreground mt-1 break-all">
-                {adapter.defaultEndpoint || '自定义端点'}
+            <RadioGroupItem value={template.protocol} className="mt-0.5" />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center justify-between gap-3">
+                <div className="font-medium">{template.title}</div>
+                <ChevronRight className="h-4 w-4 text-muted-foreground" />
               </div>
-            </CardContent>
-          </Card>
+              <p className="mt-1 text-sm text-muted-foreground">{template.description}</p>
+            </div>
+          </label>
         ))}
-
-        <Card
-          className="cursor-pointer hover:border-primary transition-colors border-dashed"
-          onClick={handleCustomPlatform}
-        >
-          <CardContent className="p-4">
-            <div className="font-medium flex items-center gap-2">
-              <Settings className="h-4 w-4" />
-              自定义配置
-            </div>
-            <div className="text-xs text-muted-foreground mt-1">
-              手动输入 API 端点和密钥
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+      </RadioGroup>
     </div>
   );
 
-  // 步骤2/编辑：平台配置表单
+  // 步骤2/编辑：供应商配置表单
   const renderPlatformForm = () => (
     <div className="space-y-6 py-4">
       <div className="grid grid-cols-2 gap-4">
         <div className="space-y-2">
-          <Label htmlFor="name">名称 *</Label>
+          <Label htmlFor="name">供应商名称 *</Label>
           <Input
             id="name"
-            placeholder="如：智谱AI"
+            placeholder="如：书言 AI"
             value={platformData.name}
             onChange={(e) =>
               setPlatformData({ ...platformData, name: e.target.value })
@@ -529,55 +581,32 @@ export function PlatformManagementDialog({
           />
         </div>
         <div className="space-y-2">
-          <Label htmlFor="slug">标识符</Label>
+          <Label htmlFor="api_key">API 密钥</Label>
           <Input
-            id="slug"
-            placeholder="如：zhipu"
-            value={platformData.slug}
+            id="api_key"
+            type="password"
+            placeholder="输入 API 密钥（可选）"
+            value={platformData.api_key}
             onChange={(e) =>
-              setPlatformData({ ...platformData, slug: e.target.value })
+              setPlatformData({ ...platformData, api_key: e.target.value })
             }
-            disabled={isEditing}
           />
-          {platformData.slug && !isEditing && (
-            <p className={`text-xs ${(platforms as Platform[]).some(p => p.slug === platformData.slug)
-                ? 'text-destructive'
-                : 'text-green-600'
-              }`}>
-              {(platforms as Platform[]).some(p => p.slug === platformData.slug)
-                ? '此标识符已被使用'
-                : '此标识符可用'}
-            </p>
-          )}
-          {isEditing && (
-            <p className="text-xs text-muted-foreground">用于系统内部识别</p>
-          )}
         </div>
       </div>
 
       <div className="space-y-2">
-        <Label htmlFor="api_endpoint">API 端点 *</Label>
+        <Label htmlFor="api_endpoint">供应商端点 *</Label>
         <Input
           id="api_endpoint"
-          placeholder="https://api.example.com/v1/chat/completions"
+          placeholder="https://platform.shuyanai.com"
           value={platformData.api_endpoint}
           onChange={(e) =>
             setPlatformData({ ...platformData, api_endpoint: e.target.value })
           }
         />
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="api_key">API 密钥</Label>
-        <Input
-          id="api_key"
-          type="password"
-          placeholder="输入 API 密钥（可选）"
-          value={platformData.api_key}
-          onChange={(e) =>
-            setPlatformData({ ...platformData, api_key: e.target.value })
-          }
-        />
+        <p className="text-xs text-muted-foreground">
+          只填写根端点即可，具体请求 URL 会根据每个模型选择的协议自动拼接。
+        </p>
       </div>
 
       <div className="space-y-2">
@@ -603,7 +632,7 @@ export function PlatformManagementDialog({
             {models.length} 个模型
           </span>
         </div>
-        <Button size="sm" onClick={handleAddModel} disabled={loading}>
+        <Button size="sm" onClick={() => handleAddModel()} disabled={loading}>
           <Plus className="h-4 w-4 mr-1" />
           添加模型
         </Button>
@@ -621,7 +650,7 @@ export function PlatformManagementDialog({
             <Card className="border-dashed">
               <CardContent className="flex flex-col items-center justify-center py-8">
                 <p className="text-muted-foreground mb-4">暂未配置任何模型</p>
-                <Button variant="outline" onClick={handleAddModel}>
+                <Button variant="outline" onClick={() => handleAddModel()}>
                   <Plus className="h-4 w-4 mr-2" />
                   添加第一个模型
                 </Button>
@@ -667,11 +696,31 @@ export function PlatformManagementDialog({
                           <Input
                             placeholder="简短描述模型用途"
                             value={model.description}
-                            onChange={(e) =>
-                              handleModelChange(index, 'description', e.target.value)
-                            }
-                          />
-                        </div>
+                              onChange={(e) =>
+                                handleModelChange(index, 'description', e.target.value)
+                              }
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-xs">协议</Label>
+                            <Select
+                              value={model.protocol}
+                              onValueChange={(value: ProviderProtocol) =>
+                                handleModelChange(index, 'protocol', value)
+                              }
+                            >
+                              <SelectTrigger className="w-full">
+                                <SelectValue placeholder="选择协议" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="openai">OpenAI</SelectItem>
+                                <SelectItem value="anthropic">Anthropic</SelectItem>
+                              </SelectContent>
+                            </Select>
+                            <p className="text-[11px] text-muted-foreground">
+                              请求地址将自动拼成 {resolveProtocolEndpoint(platformData.api_endpoint || 'https://api.example.com', model.protocol)}
+                            </p>
+                          </div>
                         <div className="flex items-center justify-between">
                           <div className="flex items-center space-x-2">
                             <Switch
@@ -729,6 +778,7 @@ export function PlatformManagementDialog({
                           </div>
                           <p className="text-sm text-muted-foreground mt-1">
                             {model.model_id}
+                            {` · ${model.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}`}
                             {model.description && ` · ${model.description}`}
                           </p>
                         </div>
@@ -740,7 +790,7 @@ export function PlatformManagementDialog({
                           <Button
                             size="sm"
                             variant="ghost"
-                            onClick={() => handleDeleteModel(model, index)}
+                            onClick={() => setConfirmDeleteModel(model)}
                             disabled={isSaving || isDeleting}
                             className="text-destructive hover:text-destructive"
                           >
@@ -763,7 +813,7 @@ export function PlatformManagementDialog({
       )}
 
       <p className="text-xs text-muted-foreground">
-        提示：模型名称用于界面显示，模型ID用于 API 调用（需与平台 API 要求一致）
+        提示：模型名称用于界面显示，模型ID用于 API 调用；同一供应商下的不同模型可以分别选择 OpenAI 或 Anthropic 协议。
       </p>
     </div>
   );
@@ -775,17 +825,17 @@ export function PlatformManagementDialog({
       return renderSelectStep();
     }
 
-    // 平台配置 + 模型配置（创建和编辑模式通用）
+    // 供应商配置 + 模型配置（创建和编辑模式通用）
     return (
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList className="grid w-full grid-cols-2">
           <TabsTrigger value="platform" className="flex items-center gap-2">
             <Globe className="h-4 w-4" />
-            平台配置
+            供应商配置
           </TabsTrigger>
           <TabsTrigger value="models" className="flex items-center gap-2">
             <Box className="h-4 w-4" />
-            模型管理
+            模型与协议
             {models.length > 0 && (
               <Badge variant="secondary" className="ml-1 h-5 px-1.5">
                 {models.length}
@@ -807,13 +857,13 @@ export function PlatformManagementDialog({
 
   // 标题和描述
   const getTitle = () => {
-    if (mode === 'create' && step === 'select') return '添加新提供商';
+    if (mode === 'create' && step === 'select') return '添加新供应商';
     return platformData.name || '配置';
   };
 
   const getDescription = () => {
-    if (mode === 'create' && step === 'select') return '选择适配器模板或自定义配置';
-    return '完成平台和模型配置后点击保存';
+    if (mode === 'create' && step === 'select') return '选择一个常用协议模板作为起点';
+    return '填写供应商端点，并为每个模型单独选择协议后保存';
   };
 
   return (
@@ -824,6 +874,12 @@ export function PlatformManagementDialog({
           <DialogDescription>{getDescription()}</DialogDescription>
         </DialogHeader>
 
+        {message && (
+          <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {message}
+          </div>
+        )}
+
         {renderContent()}
 
         {/* 底部按钮 */}
@@ -833,11 +889,11 @@ export function PlatformManagementDialog({
               <Button
                 variant="destructive"
                 size="sm"
-                onClick={handleDelete}
+                onClick={() => setConfirmDeletePlatformOpen(true)}
                 disabled={loading}
               >
                 <Trash2 className="h-4 w-4 mr-1" />
-                删除平台
+                删除供应商
               </Button>
             </div>
           )}
@@ -852,6 +908,60 @@ export function PlatformManagementDialog({
           </div>
         </DialogFooter>
       </DialogContent>
+
+      <AlertDialog
+        open={!!confirmDeleteModel}
+        onOpenChange={(open) => {
+          if (!open) setConfirmDeleteModel(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除模型</AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmDeleteModel
+                ? `确定删除模型「${confirmDeleteModel.name}」吗？相关延迟记录和评估记录也会一并删除。`
+                : '确定删除这个模型吗？'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (!confirmDeleteModel) return;
+                const index = models.findIndex((item) => item.id === confirmDeleteModel.id);
+                void handleDeleteModel(confirmDeleteModel, index);
+              }}
+            >
+              删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={confirmDeletePlatformOpen}
+        onOpenChange={setConfirmDeletePlatformOpen}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除供应商</AlertDialogTitle>
+            <AlertDialogDescription>
+              确定删除当前供应商吗？这会同时删除供应商下所有模型、延迟记录和评估记录。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => void handleDelete()}
+            >
+              删除供应商
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Dialog>
   );
 }

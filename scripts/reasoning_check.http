@@ -1,0 +1,59 @@
+@baseUrl = https://platform.shuyanai.com/v1
+@apiKey = sk-TLqhkpGBdxXfRV0LfDMFr06sOR3swii7E8S2LvpwXIncBOmj
+@model = glm-5.1
+
+### reasoning_check heavy - chat/completions protocol
+POST {{baseUrl}}/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "model": "{{model}}",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请设计一个分布式任务调度系统，要求支持：幂等、重试、优先级队列、延迟任务、失败告警。请给出：1. 架构设计 2. 核心表结构 3. 调度流程 4. 伪代码。"
+    }
+  ],
+  "stream": true
+}
+
+### reasoning_check light - chat/completions protocol
+POST {{baseUrl}}/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "model": "{{model}}",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请用精简但完整的方式回答：设计一个分布式任务调度系统，需要支持幂等、重试、优先级队列、延迟任务、失败告警。请只给出：1. 组件列表 2. 三张核心表 3. 调度流程 4. 一段伪代码。控制在 600 字以内。"
+    }
+  ],
+  "stream": false
+}
+
+### reasoning_check heavy - input protocol
+POST {{baseUrl}}/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "model": "{{model}}",
+  "input": "请设计一个分布式任务调度系统，要求支持：幂等、重试、优先级队列、延迟任务、失败告警。请给出：1. 架构设计 2. 核心表结构 3. 调度流程 4. 伪代码。"
+}
+
+### reasoning_check light - input protocol
+POST {{baseUrl}}/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "model": "{{model}}",
+  "input": "请用精简但完整的方式回答：设计一个分布式任务调度系统，需要支持幂等、重试、优先级队列、延迟任务、失败告警。请只给出：1. 组件列表 2. 三张核心表 3. 调度流程 4. 一段伪代码。控制在 600 字以内。"
+}
