@@ -1,0 +1,79 @@
+import { z } from 'zod';
+
+export const jsonValueSchema = z.record(z.string(), z.unknown()).nullable().optional();
+
+export const insertPlatformSchema = z.object({
+  name: z.string().min(1),
+  slug: z.string().min(1),
+  description: z.string().nullable().optional(),
+  api_endpoint: z.string().min(1),
+  api_key: z.string().nullable().optional(),
+  is_active: z.boolean().optional(),
+  config: jsonValueSchema,
+});
+
+export type InsertPlatform = z.infer<typeof insertPlatformSchema>;
+
+export interface Platform {
+  id: number;
+  name: string;
+  slug: string;
+  description: string | null;
+  api_endpoint: string;
+  api_key: string | null;
+  is_active: boolean;
+  config: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export const insertModelSchema = z.object({
+  platform_id: z.number().int().positive(),
+  name: z.string().min(1),
+  model_id: z.string().min(1),
+  description: z.string().nullable().optional(),
+  is_active: z.boolean().optional(),
+  config: jsonValueSchema,
+});
+
+export type InsertModel = z.infer<typeof insertModelSchema>;
+
+export interface Model {
+  id: number;
+  platform_id: number;
+  name: string;
+  model_id: string;
+  description: string | null;
+  is_active: boolean;
+  config: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export const insertPingRecordSchema = z.object({
+  model_id: z.number().int().positive(),
+  platform_id: z.number().int().positive(),
+  latency_ms: z.number().int().nullable().optional(),
+  ttft_ms: z.number().int().nullable().optional(),
+  total_time_ms: z.number().int().nullable().optional(),
+  status: z.enum(['success', 'error', 'timeout', 'pending']).optional(),
+  error_message: z.string().nullable().optional(),
+  request_params: jsonValueSchema,
+  response_data: jsonValueSchema,
+});
+
+export type InsertPingRecord = z.infer<typeof insertPingRecordSchema>;
+
+export interface PingRecord {
+  id: number;
+  model_id: number;
+  platform_id: number;
+  latency_ms: number | null;
+  ttft_ms: number | null;
+  total_time_ms: number | null;
+  status: 'success' | 'error' | 'timeout' | 'pending';
+  error_message: string | null;
+  request_params: Record<string, unknown> | null;
+  response_data: Record<string, unknown> | null;
+  created_at: string;
+}
