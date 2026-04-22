@@ -156,7 +156,7 @@ export function MonitoringDashboard({
   const [localError, setLocalError] = useState<string | null>(null);
 
   const { statuses, platforms, summary, fetchStatus, loading: statusLoading, error: statusError } = useStatus();
-  const { pingModel, loading: pingLoading } = usePing();
+  const { pingAll, pingModel, loading: pingLoading } = usePing();
   const { evaluateModel, evaluatingId, loading: evaluationLoading, error: evaluationError } = useEvaluation();
   const { init, loading: initLoading } = useInitPlatforms();
 
@@ -232,6 +232,16 @@ export function MonitoringDashboard({
       setLocalError(error instanceof Error ? error.message : '延迟测试失败');
     }
   }, [loadStatus, pingModel]);
+
+  const handlePingAll = useCallback(async () => {
+    setLocalError(null);
+    try {
+      await pingAll();
+      await loadStatus();
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : '批量延迟测试失败');
+    }
+  }, [loadStatus, pingAll]);
 
   const openCreateDialog = useCallback(() => {
     setEditingPlatform(null);
@@ -330,6 +340,10 @@ export function MonitoringDashboard({
           <Button variant="outline" size="sm" onClick={loadStatus} disabled={statusLoading}>
             <RefreshCw className="mr-2 h-4 w-4" />
             刷新
+          </Button>
+          <Button variant="outline" size="sm" onClick={handlePingAll} disabled={pingLoading || evaluationLoading}>
+            {pingLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Zap className="mr-2 h-4 w-4" />}
+            一键获取实时延迟
           </Button>
           <Button variant="outline" size="sm" onClick={openCreateDialog}>
             <Plus className="mr-2 h-4 w-4" />

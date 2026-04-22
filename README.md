@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="public/readme-cover.png" alt="LLM Monitoring logo" width="240" />
+</p>
+
 # LLM Monitoring
 
 一个用于监控第三方大模型服务延迟和可用性的本地化监控面板。

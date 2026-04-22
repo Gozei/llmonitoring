@@ -170,6 +170,14 @@ const TEST_CASES: TestCaseConfig[] = [
 
 const TEST_CASE_ORDER = TEST_CASES.map(item => item.name);
 const TEST_CASE_MAP = new Map(TEST_CASES.map(item => [item.name, item]));
+const CASE_SCORE_WEIGHTS: Record<string, number> = {
+  connectivity_check: 1,
+  identity_check: 2.5,
+  json_check: 1,
+  code_check: 1,
+  reasoning_check: 1,
+  consistency_check: 1,
+};
 
 const STRICT_JSON_EXPECTED: JsonCheckPayload = {
   ok: true,
@@ -280,6 +288,15 @@ function getCaseLatencySeconds(summary: EvaluationCaseSummary): number {
   return typeof observed === 'number' ? observed : config.timeout;
 }
 
+function getIdentityPenaltyFactor(identityScore: number | null | undefined): number {
+  if (identityScore == null) return 0.55;
+  if (identityScore >= 85) return 1;
+  if (identityScore >= 70) return 0.9;
+  if (identityScore >= 60) return 0.75;
+  if (identityScore >= 40) return 0.55;
+  return 0.35;
+}
+
 function parseJsonObject(text: string): JsonObject | null {
   const candidates = [
     text.trim(),
@@ -304,17 +321,6 @@ function parseJsonObject(text: string): JsonObject | null {
 function isBareJsonObjectText(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.startsWith('{') && trimmed.endsWith('}');
-}
-
-function normalizeToken(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
-}
-
-function textMatches(a: string, b: string): boolean {
-  const left = normalizeToken(a);
-  const right = normalizeToken(b);
-  if (!left || !right) return false;
-  return left.includes(right) || right.includes(left);
 }
 
 function dominantRatio(values: Array<string | boolean>): number {
@@ -460,17 +466,60 @@ function calcIdentitySelfConsistency(payloads: IdentityPayload[]): number {
   return Number(((modelStability * 0.4) + (cutoffStability * 0.35) + (toolStability * 0.25)).toFixed(3));
 }
 
-function calcIdentityAlignment(payloads: IdentityPayload[], runs: EvaluationRun[]): number {
-  const successfulRuns = runs.filter(run => run.ok && run.content);
-  if (payloads.length === 0 || successfulRuns.length === 0) return 0;
+function calcIdentityModelSpecificity(payloads: IdentityPayload[]): number {
+  if (payloads.length === 0) return 0;
 
-  const aligned = successfulRuns.reduce((count, run, index) => {
-    const payload = payloads[index];
-    if (!payload || !run.response_model) return count;
-    return count + (textMatches(payload.self_model, run.response_model) ? 1 : 0);
-  }, 0);
+  const knownModelKeywords = [
+    'gpt', 'claude', 'gemini', 'llama', 'qwen', 'deepseek', 'glm', 'yi',
+    'doubao', 'hunyuan', 'kimi', 'moonshot', 'mistral', 'grok', 'ernie',
+    'baichuan', 'minimax',
+  ];
+  const genericKeywords = [
+    'ai', 'assistant', 'language model', 'large language model', 'chatbot',
+    '人工智能', '助手', '模型', '大语言模型',
+  ];
 
-  return Number((aligned / successfulRuns.length).toFixed(3));
+  const scores = payloads.map((payload) => {
+    const normalized = payload.self_model.trim().toLowerCase();
+    if (!normalized) return 0;
+
+    const hasKnownKeyword = knownModelKeywords.some(keyword => normalized.includes(keyword));
+    const hasConcreteShape = /[a-z]+\d|[\d.]+|[-_]/i.test(payload.self_model);
+    const genericOnly = genericKeywords.some(keyword => normalized.includes(keyword))
+      && !hasKnownKeyword
+      && !hasConcreteShape;
+
+    if (genericOnly) return 0.2;
+    if (hasKnownKeyword && hasConcreteShape) return 1;
+    if (hasKnownKeyword || hasConcreteShape) return 0.8;
+    if (payload.self_model.trim().length >= 6) return 0.5;
+    return 0.3;
+  });
+
+  return Number(mean(scores).toFixed(3));
+}
+
+function calcKnowledgeCutoffSpecificity(payloads: IdentityPayload[]): number {
+  if (payloads.length === 0) return 0;
+
+  const scores = payloads.map((payload) => {
+    const value = payload.knowledge_cutoff.trim().toLowerCase();
+    if (!value || ['unknown', 'n/a', 'none', '不知道', '不清楚'].includes(value)) {
+      return 0;
+    }
+    if (/^\d{4}[-/]\d{1,2}([-/]\d{1,2})?$/.test(value)) {
+      return 1;
+    }
+    if (/^\d{4}$/.test(value)) {
+      return 0.7;
+    }
+    if (/(20\d{2}|19\d{2})/.test(value)) {
+      return 0.6;
+    }
+    return 0.4;
+  });
+
+  return Number(mean(scores).toFixed(3));
 }
 
 function deepEqualJson(left: JsonObject, right: JsonObject): boolean {
@@ -601,27 +650,27 @@ function evaluateConnectivityCase(texts: string[], successRate: number): CaseEva
   };
 }
 
-function evaluateIdentityCase(runs: EvaluationRun[], texts: string[], successRate: number): CaseEvaluation {
+function evaluateIdentityCase(_runs: EvaluationRun[], texts: string[], successRate: number): CaseEvaluation {
   const payloads = texts.map(parseIdentityPayload).filter((value): value is IdentityPayload => Boolean(value));
   const schemaValidity = calcSchemaValidity(texts, parseIdentityPayload);
   const selfConsistency = calcIdentitySelfConsistency(payloads);
-  const responseConsistency = calcResponseModelConsistency(runs);
-  const alignment = calcIdentityAlignment(payloads, runs);
+  const modelSpecificity = calcIdentityModelSpecificity(payloads);
+  const cutoffSpecificity = calcKnowledgeCutoffSpecificity(payloads);
 
   return {
     score: toScore(
       successRate * 0.2 +
-      schemaValidity * 0.25 +
-      selfConsistency * 0.25 +
-      responseConsistency * 0.15 +
-      alignment * 0.15
+      schemaValidity * 0.3 +
+      selfConsistency * 0.3 +
+      modelSpecificity * 0.12 +
+      cutoffSpecificity * 0.08
     ),
     metrics: [
       createMetric('success_rate', '成功率', successRate),
       createMetric('schema_validity', '结构合法', schemaValidity),
       createMetric('self_consistency', '自报一致', selfConsistency),
-      createMetric('response_consistency', '返回模型稳定', responseConsistency),
-      createMetric('model_alignment', '自报与返回对齐', alignment),
+      createMetric('model_specificity', '模型名具体性', modelSpecificity),
+      createMetric('cutoff_specificity', '截止时间具体性', cutoffSpecificity),
     ],
   };
 }
@@ -955,9 +1004,15 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
   const totalCalls = report.reduce((sum, item) => sum + item.calls, 0);
   const totalSuccessCalls = report.reduce((sum, item) => sum + item.success_calls, 0);
   const overallSuccessRate = totalCalls > 0 ? totalSuccessCalls / totalCalls : 0;
+  const identity = byCase.get('identity_check');
+  const identityPenaltyFactor = getIdentityPenaltyFactor(identity?.score);
   const evaluationComplete = TEST_CASE_ORDER.every(caseName => byCase.has(caseName));
-  const rawScore = TEST_CASE_ORDER.length > 0
-    ? Math.round(mean(TEST_CASE_ORDER.map(caseName => byCase.get(caseName)?.score ?? 0)))
+  const totalWeight = TEST_CASE_ORDER.reduce((sum, caseName) => sum + (CASE_SCORE_WEIGHTS[caseName] ?? 1), 0);
+  const rawScore = totalWeight > 0
+    ? Math.round(TEST_CASE_ORDER.reduce((sum, caseName) => {
+      const weight = CASE_SCORE_WEIGHTS[caseName] ?? 1;
+      return sum + (byCase.get(caseName)?.score ?? 0) * weight;
+    }, 0) / totalWeight)
     : 0;
   const avgLatencyMs = TEST_CASE_ORDER.length > 0
     ? Math.round(mean(TEST_CASE_ORDER.map(caseName => {
@@ -978,10 +1033,10 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
     return sum + penaltyRatio * config.max_penalty;
   }, 0), 1);
   const latencyAdjustedScore = clamp(rawScore - latencyPenalty, 0, 100);
-  const score = Math.round(latencyAdjustedScore * overallSuccessRate);
+  const score = Math.round(latencyAdjustedScore * overallSuccessRate * identityPenaltyFactor);
 
   if (evaluationComplete) {
-    notes.push(`6 维能力均分 ${rawScore}`);
+    notes.push(`加权能力分 ${rawScore}`);
   } else {
     risks.push('评估不完整，已按缺失维度 0 分和超时口径处理');
   }
@@ -1000,6 +1055,12 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
     risks.push(`总分已乘整体调用成功率 ${(overallSuccessRate * 100).toFixed(1)}%`);
   }
 
+  if (identityPenaltyFactor >= 1) {
+    notes.push('身份一致性未触发额外惩罚');
+  } else {
+    risks.push(`总分已乘身份一致性系数 x${identityPenaltyFactor.toFixed(2)}`);
+  }
+
   if (avgLatencyMs != null) {
     const avgLatencySeconds = roundTo(avgLatencyMs / 1000, 1);
     if (avgLatencySeconds <= 6) {
@@ -1013,7 +1074,6 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
   }
 
   const conn = byCase.get('connectivity_check');
-  const identity = byCase.get('identity_check');
   const jsonCase = byCase.get('json_check');
   const codeCase = byCase.get('code_check');
   const reasoning = byCase.get('reasoning_check');
@@ -1030,14 +1090,12 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
   if (identity) {
     if (identity.score >= 85) {
       notes.push('身份信息返回较稳定');
+    } else if (identity.score >= 70) {
+      risks.push(`身份验证得分偏低（当前 ${identity.score}）`);
     } else if (identity.score < 60) {
-      risks.push('身份一致性较弱');
-    }
-
-    if (identity.response_models.length === 1) {
-      notes.push(`返回 model 字段固定：${identity.response_models[0]}`);
+      risks.push(`身份验证明显偏低（当前 ${identity.score}），可能存在套壳或自报不实`);
     } else {
-      risks.push('返回 model 字段不稳定或缺失');
+      risks.push(`身份一致性较弱（当前 ${identity.score}）`);
     }
   }
 
@@ -1165,8 +1223,9 @@ export async function evaluateModel(
   }
 
   const finalScore = scoreModel(allSummaries);
+  const identitySummary = allSummaries.find(item => item.case === 'identity_check');
   console.log(
-    `[evaluation] done platform="${platform.name}" model="${model.name}" raw_score=${finalScore.raw_score} latency_penalty=${finalScore.latency_penalty} score=${finalScore.score} avg_latency_ms=${finalScore.avg_latency_ms ?? 'n/a'} level="${finalScore.level}" duration_ms=${Date.now() - startedAt}`
+    `[evaluation] done platform="${platform.name}" model="${model.name}" raw_score=${finalScore.raw_score} identity_score=${identitySummary?.score ?? 'n/a'} identity_factor=${getIdentityPenaltyFactor(identitySummary?.score).toFixed(2)} latency_penalty=${finalScore.latency_penalty} score=${finalScore.score} avg_latency_ms=${finalScore.avg_latency_ms ?? 'n/a'} level="${finalScore.level}" duration_ms=${Date.now() - startedAt}`
   );
   console.log(`[evaluation] notes ${JSON.stringify(finalScore.notes)}`);
   console.log(`[evaluation] risks ${JSON.stringify(finalScore.risks)}`);
