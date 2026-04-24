@@ -4,7 +4,7 @@
 
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 
 const API_BASE = '/api';
 
@@ -24,6 +24,12 @@ async function fetchApi<T>(url: string, options?: RequestInit): Promise<T> {
   }
 
   return data;
+}
+
+function createEvaluationCancelledError(): Error {
+  const error = new Error('评估已取消');
+  error.name = 'EvaluationCancelledError';
+  return error;
 }
 
 /**
@@ -357,28 +363,104 @@ export function useEvaluation() {
   const [loading, setLoading] = useState(false);
   const [evaluatingId, setEvaluatingId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const activeTaskRef = useRef<{
+    taskId: string;
+    modelId: number;
+    controller?: AbortController;
+  } | null>(null);
+
+  const syncActiveEvaluation = useCallback(async () => {
+    try {
+      const result = await fetchApi<{ data: { active_tasks: Array<{ taskId: string; modelId: number }> } }>('/evaluations?active=1');
+      const activeTask = result.data.active_tasks[0] ?? null;
+      if (activeTask) {
+        activeTaskRef.current = {
+          taskId: activeTask.taskId,
+          modelId: activeTask.modelId,
+        };
+        setEvaluatingId(activeTask.modelId);
+        setLoading(true);
+      } else {
+        activeTaskRef.current = null;
+        setEvaluatingId(null);
+        setLoading(false);
+      }
+    } catch {
+      // Ignore polling failures; the page can still work with local state.
+    }
+  }, []);
+
+  useEffect(() => {
+    void syncActiveEvaluation();
+  }, [syncActiveEvaluation]);
 
   const evaluateModel = useCallback(async (modelId: number) => {
+    if (activeTaskRef.current) {
+      throw new Error('已有评估任务进行中');
+    }
+
+    const taskId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const controller = new AbortController();
+    activeTaskRef.current = { taskId, modelId, controller };
     setLoading(true);
     setEvaluatingId(modelId);
     setError(null);
     try {
       const result = await fetchApi<{ data: unknown }>('/evaluations', {
         method: 'POST',
-        body: JSON.stringify({ model_id: modelId }),
+        body: JSON.stringify({ model_id: modelId, task_id: taskId }),
+        signal: controller.signal,
       });
       return result;
     } catch (err) {
+      const wasCancelled = controller.signal.aborted
+        || (err instanceof Error && (err.name === 'AbortError' || err.name === 'EvaluationCancelledError' || err.message === '评估已取消'));
+      if (wasCancelled) {
+        throw createEvaluationCancelledError();
+      }
+
+      const maybeConflict = err instanceof Error && err.message === '该模型已有评估任务进行中';
+      if (maybeConflict) {
+        try {
+          await syncActiveEvaluation();
+        } catch {
+          // noop
+        }
+      }
+
       const message = err instanceof Error ? err.message : 'Failed to run evaluation';
       setError(message);
       throw err;
     } finally {
-      setLoading(false);
-      setEvaluatingId(null);
+      if (activeTaskRef.current?.taskId === taskId) {
+        activeTaskRef.current = null;
+        setLoading(false);
+        setEvaluatingId(null);
+      }
+    }
+  }, [syncActiveEvaluation]);
+
+  const cancelEvaluation = useCallback(async () => {
+    const activeTask = activeTaskRef.current;
+    if (!activeTask) return;
+
+    activeTask.controller?.abort();
+    activeTaskRef.current = null;
+    setLoading(false);
+    setEvaluatingId(null);
+    setError(null);
+
+    try {
+      await fetchApi<{ data: { task_id: string; cancelled: boolean } }>('/evaluations', {
+        method: 'DELETE',
+        body: JSON.stringify({ task_id: activeTask.taskId }),
+      });
+    } catch {
+      // Ignore cancellation transport errors; the UI already stopped and the server may have already finished.
     }
   }, []);
 
-  return { evaluateModel, loading, evaluatingId, error };
+  return { evaluateModel, cancelEvaluation, syncActiveEvaluation, loading, evaluatingId, error };
 }
 
 /**

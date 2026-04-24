@@ -5,7 +5,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   ArrowUpDown,
@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Settings,
   ShieldAlert,
+  Square,
   Sparkles,
   Zap,
 } from 'lucide-react';
@@ -90,6 +91,10 @@ function formatPenalty(value: number | null | undefined): string {
   return `-${value.toFixed(1)}`;
 }
 
+function isEvaluationCancelledError(error: unknown): boolean {
+  return error instanceof Error && (error.name === 'EvaluationCancelledError' || error.message === '评估已取消');
+}
+
 function caseScoreTone(score: number): string {
   if (score >= 90) return 'border-emerald-200 bg-emerald-50 text-emerald-700';
   if (score >= 60) return 'border-amber-200 bg-amber-50 text-amber-700';
@@ -151,13 +156,16 @@ export function MonitoringDashboard({
 }: MonitoringDashboardProps) {
   const [initialized, setInitialized] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
+  const [pingingModelId, setPingingModelId] = useState<number | null>(null);
+  const [pingingAll, setPingingAll] = useState(false);
   const [managementDialogOpen, setManagementDialogOpen] = useState(false);
   const [editingPlatform, setEditingPlatform] = useState<Platform | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const pingInFlightRef = useRef(false);
 
   const { statuses, platforms, summary, fetchStatus, loading: statusLoading, error: statusError } = useStatus();
   const { pingAll, pingModel, loading: pingLoading } = usePing();
-  const { evaluateModel, evaluatingId, loading: evaluationLoading, error: evaluationError } = useEvaluation();
+  const { evaluateModel, cancelEvaluation, syncActiveEvaluation, evaluatingId, loading: evaluationLoading, error: evaluationError } = useEvaluation();
   const { init, loading: initLoading } = useInitPlatforms();
 
   const typedStatuses = statuses as ModelStatus[];
@@ -166,7 +174,8 @@ export function MonitoringDashboard({
 
   const loadStatus = useCallback(async () => {
     await fetchStatus(24);
-  }, [fetchStatus]);
+    await syncActiveEvaluation();
+  }, [fetchStatus, syncActiveEvaluation]);
 
   useEffect(() => {
     loadStatus()
@@ -214,32 +223,52 @@ export function MonitoringDashboard({
 
   const handleEvaluate = useCallback(async (modelId: number) => {
     setLocalError(null);
+    if (evaluationLoading && evaluatingId === modelId) {
+      await cancelEvaluation();
+      return;
+    }
+
     try {
       await evaluateModel(modelId);
       await loadStatus();
       setSelectedModelId(modelId);
     } catch (error) {
+      if (isEvaluationCancelledError(error)) {
+        return;
+      }
       setLocalError(error instanceof Error ? error.message : '综合评估失败');
     }
-  }, [evaluateModel, loadStatus]);
+  }, [cancelEvaluation, evaluateModel, evaluatingId, evaluationLoading, loadStatus]);
 
   const handlePing = useCallback(async (modelId: number) => {
+    if (pingInFlightRef.current) return;
+    pingInFlightRef.current = true;
     setLocalError(null);
+    setPingingModelId(modelId);
     try {
       await pingModel(modelId);
       await loadStatus();
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : '延迟测试失败');
+    } finally {
+      setPingingModelId(null);
+      pingInFlightRef.current = false;
     }
   }, [loadStatus, pingModel]);
 
   const handlePingAll = useCallback(async () => {
+    if (pingInFlightRef.current) return;
+    pingInFlightRef.current = true;
     setLocalError(null);
+    setPingingAll(true);
     try {
       await pingAll();
       await loadStatus();
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : '批量延迟测试失败');
+    } finally {
+      setPingingAll(false);
+      pingInFlightRef.current = false;
     }
   }, [loadStatus, pingAll]);
 
@@ -341,8 +370,8 @@ export function MonitoringDashboard({
             <RefreshCw className="mr-2 h-4 w-4" />
             刷新
           </Button>
-          <Button variant="outline" size="sm" onClick={handlePingAll} disabled={pingLoading || evaluationLoading}>
-            {pingLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Zap className="mr-2 h-4 w-4" />}
+          <Button variant="outline" size="sm" onClick={handlePingAll} disabled={pingLoading || evaluationLoading || pingingAll || pingingModelId !== null}>
+            {pingingAll ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Zap className="mr-2 h-4 w-4" />}
             一键获取实时延迟
           </Button>
           <Button variant="outline" size="sm" onClick={openCreateDialog}>
@@ -405,6 +434,7 @@ export function MonitoringDashboard({
                   {sortedModels.map((item) => {
                     const evaluation = item.evaluation;
                     const isSelected = selectedStatus?.model.id === item.model.id;
+                    const isPingingCurrent = pingLoading && pingingModelId === item.model.id;
                     return (
                       <TableRow
                         key={item.model.id}
@@ -439,9 +469,13 @@ export function MonitoringDashboard({
                                 event.stopPropagation();
                                 handlePing(item.model.id);
                               }}
-                              disabled={pingLoading || evaluationLoading}
+                              disabled={pingLoading || evaluationLoading || pingingAll || pingingModelId !== null}
                             >
-                              <Zap className="mr-1 h-4 w-4" />
+                              {isPingingCurrent ? (
+                                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                              ) : (
+                                <Zap className="mr-1 h-4 w-4" />
+                              )}
                               延迟
                             </Button>
                             <Button
@@ -450,14 +484,14 @@ export function MonitoringDashboard({
                                 event.stopPropagation();
                                 handleEvaluate(item.model.id);
                               }}
-                              disabled={evaluationLoading}
+                              disabled={evaluationLoading && evaluatingId !== item.model.id}
                             >
-                              {evaluatingId === item.model.id ? (
-                                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                              {evaluatingId === item.model.id && evaluationLoading ? (
+                                <Square className="mr-1 h-4 w-4" />
                               ) : (
                                 <Sparkles className="mr-1 h-4 w-4" />
                               )}
-                              评估
+                              {evaluatingId === item.model.id && evaluationLoading ? '终止评估' : '评估'}
                             </Button>
                           </div>
                         </TableCell>
@@ -580,9 +614,17 @@ export function MonitoringDashboard({
                       点击评估会执行多轮真实调用，耗时取决于平台响应速度。
                     </p>
                     {selectedStatus && (
-                      <Button className="mt-4" onClick={() => handleEvaluate(selectedStatus.model.id)} disabled={evaluationLoading}>
-                        {evaluatingId === selectedStatus.model.id && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                        开始评估
+                      <Button
+                        className="mt-4"
+                        onClick={() => handleEvaluate(selectedStatus.model.id)}
+                        disabled={evaluationLoading && evaluatingId !== selectedStatus.model.id}
+                      >
+                        {evaluatingId === selectedStatus.model.id && evaluationLoading ? (
+                          <Square className="mr-2 h-4 w-4" />
+                        ) : (
+                          <Sparkles className="mr-2 h-4 w-4" />
+                        )}
+                        {evaluatingId === selectedStatus.model.id && evaluationLoading ? '终止评估' : '开始评估'}
                       </Button>
                     )}
                   </div>

@@ -2,7 +2,7 @@
   <img src="public/readme-cover.png" alt="LLM Monitoring logo" width="240" />
 </p>
 
-# LLM Monitoring
+# LLMonitoring
 
 一个用于监控第三方大模型服务延迟和可用性的本地化监控面板。
 
@@ -120,6 +120,42 @@ SQLITE_DATABASE_PATH=/data/llmmonitoring.db
 ```
 
 并将容器内 `/data` 挂载到宿主机目录。
+
+### Docker 构建与运行
+
+项目根目录已提供 `Dockerfile`，可以直接构建镜像：
+
+```bash
+docker build -t llm-monitoring .
+```
+
+运行容器：
+
+```bash
+docker run -d \
+  --name llm-monitoring \
+  -p 5000:5000 \
+  -e SQLITE_DATABASE_PATH=/data/llmmonitoring.db \
+  -v $(pwd)/data:/data \
+  llm-monitoring
+```
+
+启动后访问：
+
+```text
+http://localhost:5000
+```
+
+如果你希望改端口，可以同时调整容器内外端口，例如：
+
+```bash
+docker run -d \
+  --name llm-monitoring \
+  -p 8080:5000 \
+  -e SQLITE_DATABASE_PATH=/data/llmmonitoring.db \
+  -v $(pwd)/data:/data \
+  llm-monitoring
+```
 
 ## 项目结构
 

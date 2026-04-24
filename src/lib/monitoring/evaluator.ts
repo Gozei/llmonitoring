@@ -83,6 +83,18 @@ type TestCaseConfig = {
   max_penalty: number;
 };
 
+type EvaluationControl = {
+  cancelSignal?: AbortSignal;
+  isCancelled?: () => boolean;
+};
+
+export class EvaluationCancelledError extends Error {
+  constructor(message = 'evaluation cancelled') {
+    super(message);
+    this.name = 'EvaluationCancelledError';
+  }
+}
+
 function preview(text: string, limit = 180): string {
   return text.replace(/\s+/g, ' ').trim().slice(0, limit);
 }
@@ -105,7 +117,7 @@ const TEST_CASES: TestCaseConfig[] = [
       '请严格只输出 JSON，不要输出 Markdown、代码块或解释。' +
       '字段必须完整且类型正确：' +
       '{"self_model":"你的模型名","knowledge_cutoff":"你的知识截止时间","supports_function_call":true}',
-    repeat: 3,
+    repeat: 5,
     timeout: 30,
     stream: false,
     latency_metric: 'latency',
@@ -295,6 +307,35 @@ function getIdentityPenaltyFactor(identityScore: number | null | undefined): num
   if (identityScore >= 60) return 0.75;
   if (identityScore >= 40) return 0.55;
   return 0.35;
+}
+
+function throwIfEvaluationCancelled(control?: EvaluationControl): void {
+  if (control?.cancelSignal?.aborted || control?.isCancelled?.()) {
+    throw new EvaluationCancelledError();
+  }
+}
+
+async function waitWithCancellation(ms: number, control?: EvaluationControl): Promise<void> {
+  throwIfEvaluationCancelled(control);
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      cleanup();
+      reject(new EvaluationCancelledError());
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      control?.cancelSignal?.removeEventListener('abort', onAbort);
+    };
+
+    control?.cancelSignal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function parseJsonObject(text: string): JsonObject | null {
@@ -499,6 +540,62 @@ function calcIdentityModelSpecificity(payloads: IdentityPayload[]): number {
   return Number(mean(scores).toFixed(3));
 }
 
+function normalizeModelIdentity(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_]+/g, '-');
+}
+
+function detectModelFamily(value: string): string | null {
+  const normalized = normalizeModelIdentity(value);
+  const families = [
+    'gpt', 'claude', 'gemini', 'llama', 'qwen', 'deepseek', 'glm', 'yi',
+    'doubao', 'hunyuan', 'kimi', 'moonshot', 'mistral', 'grok', 'ernie',
+    'baichuan', 'minimax',
+  ];
+
+  return families.find(family => normalized.includes(family)) ?? null;
+}
+
+function extractModelVersion(value: string): string | null {
+  const normalized = normalizeModelIdentity(value);
+  const match = normalized.match(/(\d+(?:\.\d+){0,2})/);
+  return match?.[1] ?? null;
+}
+
+function calcIdentityExpectedModelMatch(payloads: IdentityPayload[], expectedModelId: string): number {
+  if (payloads.length === 0) return 0;
+
+  const normalizedExpected = normalizeModelIdentity(expectedModelId);
+  const expectedFamily = detectModelFamily(expectedModelId);
+  const expectedVersion = extractModelVersion(expectedModelId);
+
+  const scores = payloads.map((payload) => {
+    const reported = payload.self_model.trim();
+    const normalizedReported = normalizeModelIdentity(reported);
+    if (!normalizedReported) return 0;
+    if (normalizedReported === normalizedExpected) return 1;
+
+    const reportedFamily = detectModelFamily(reported);
+    const reportedVersion = extractModelVersion(reported);
+    const familyMatch = Boolean(expectedFamily && reportedFamily && expectedFamily === reportedFamily);
+
+    if (familyMatch && expectedVersion && reportedVersion) {
+      if (reportedVersion === expectedVersion) return 0.95;
+      if (reportedVersion.split('.')[0] === expectedVersion.split('.')[0]) return 0.35;
+      return 0.15;
+    }
+
+    if (familyMatch && expectedVersion && !reportedVersion) return 0.2;
+    if (familyMatch && !expectedVersion) return 0.7;
+    if (normalizedExpected.includes(normalizedReported) || normalizedReported.includes(normalizedExpected)) {
+      return 0.5;
+    }
+
+    return 0;
+  });
+
+  return Number(mean(scores).toFixed(3));
+}
+
 function calcKnowledgeCutoffSpecificity(payloads: IdentityPayload[]): number {
   if (payloads.length === 0) return 0;
 
@@ -650,25 +747,33 @@ function evaluateConnectivityCase(texts: string[], successRate: number): CaseEva
   };
 }
 
-function evaluateIdentityCase(_runs: EvaluationRun[], texts: string[], successRate: number): CaseEvaluation {
+function evaluateIdentityCase(
+  _runs: EvaluationRun[],
+  texts: string[],
+  successRate: number,
+  expectedModelId: string
+): CaseEvaluation {
   const payloads = texts.map(parseIdentityPayload).filter((value): value is IdentityPayload => Boolean(value));
   const schemaValidity = calcSchemaValidity(texts, parseIdentityPayload);
   const selfConsistency = calcIdentitySelfConsistency(payloads);
+  const exactModelMatch = calcIdentityExpectedModelMatch(payloads, expectedModelId);
   const modelSpecificity = calcIdentityModelSpecificity(payloads);
   const cutoffSpecificity = calcKnowledgeCutoffSpecificity(payloads);
 
   return {
     score: toScore(
-      successRate * 0.2 +
-      schemaValidity * 0.3 +
-      selfConsistency * 0.3 +
-      modelSpecificity * 0.12 +
-      cutoffSpecificity * 0.08
+      successRate * 0.15 +
+      schemaValidity * 0.25 +
+      selfConsistency * 0.25 +
+      exactModelMatch * 0.25 +
+      modelSpecificity * 0.05 +
+      cutoffSpecificity * 0.05
     ),
     metrics: [
       createMetric('success_rate', '成功率', successRate),
       createMetric('schema_validity', '结构合法', schemaValidity),
       createMetric('self_consistency', '自报一致', selfConsistency),
+      createMetric('expected_model_match', '与配置模型匹配', exactModelMatch),
       createMetric('model_specificity', '模型名具体性', modelSpecificity),
       createMetric('cutoff_specificity', '截止时间具体性', cutoffSpecificity),
     ],
@@ -737,12 +842,18 @@ function evaluateConsistencyCase(texts: string[], successRate: number): CaseEval
   };
 }
 
-function evaluateCase(caseName: string, runs: EvaluationRun[], texts: string[], successRate: number): CaseEvaluation {
+function evaluateCase(
+  caseName: string,
+  runs: EvaluationRun[],
+  texts: string[],
+  successRate: number,
+  model: Model
+): CaseEvaluation {
   switch (caseName) {
     case 'connectivity_check':
       return evaluateConnectivityCase(texts, successRate);
     case 'identity_check':
-      return evaluateIdentityCase(runs, texts, successRate);
+      return evaluateIdentityCase(runs, texts, successRate, model.model_id);
     case 'json_check':
       return evaluateJsonCase(texts, successRate);
     case 'code_check':
@@ -783,7 +894,8 @@ function resolvePayload(
 
 async function parseStreamingResponse(
   response: Response,
-  startedAtMs: number
+  startedAtMs: number,
+  control?: EvaluationControl
 ): Promise<{
   rawText: string;
   content: string;
@@ -806,6 +918,7 @@ async function parseStreamingResponse(
   let usage: unknown = null;
 
   while (true) {
+    throwIfEvaluationCancelled(control);
     const { done, value } = await reader.read();
     if (done) break;
 
@@ -854,7 +967,8 @@ async function callModel(
   caseName: string,
   promptText: string,
   timeoutSeconds: number,
-  stream: boolean
+  stream: boolean,
+  control?: EvaluationControl
 ): Promise<EvaluationRun> {
   const url = resolveEvaluationUrl(platform, model);
   const headers = buildProtocolHeaders({
@@ -882,9 +996,16 @@ async function callModel(
   };
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+  let timedOut = false;
+  const onCancel = () => controller.abort();
+  control?.cancelSignal?.addEventListener('abort', onCancel, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutSeconds * 1000);
 
   try {
+    throwIfEvaluationCancelled(control);
     const response = await fetch(url, {
       method: 'POST',
       headers,
@@ -897,7 +1018,7 @@ async function callModel(
     result.ok = response.ok;
 
     if (stream) {
-      const streamResult = await parseStreamingResponse(response, startedAt);
+      const streamResult = await parseStreamingResponse(response, startedAt, control);
       result.raw_text = streamResult.rawText;
       result.response_model = streamResult.responseModel;
       result.content = streamResult.content;
@@ -921,6 +1042,8 @@ async function callModel(
       result.usage = data.usage ?? null;
     }
 
+    throwIfEvaluationCancelled(control);
+
     if (!result.content && response.ok) {
       result.error = 'response parsed but no text content found';
     }
@@ -928,6 +1051,23 @@ async function callModel(
     return result;
   } catch (error) {
     result.elapsed_seconds = Number(((Date.now() - startedAt) / 1000).toFixed(3));
+    if (error instanceof Error && error.name === 'AbortError') {
+      if (control?.cancelSignal?.aborted || control?.isCancelled?.()) {
+        throw new EvaluationCancelledError();
+      }
+
+      if (timedOut) {
+        result.timed_out = true;
+        result.request_exception = `AbortError: request exceeded ${timeoutSeconds}s`;
+        result.error = 'request timed out';
+        return result;
+      }
+    }
+
+    if (error instanceof EvaluationCancelledError) {
+      throw error;
+    }
+
     if (error instanceof Error && error.name === 'AbortError') {
       result.timed_out = true;
       result.request_exception = `AbortError: request exceeded ${timeoutSeconds}s`;
@@ -942,10 +1082,11 @@ async function callModel(
     return result;
   } finally {
     clearTimeout(timeout);
+    control?.cancelSignal?.removeEventListener('abort', onCancel);
   }
 }
 
-function summarizeCase(caseName: string, runs: EvaluationRun[]): EvaluationCaseSummary {
+function summarizeCase(caseName: string, runs: EvaluationRun[], model: Model): EvaluationCaseSummary {
   const config = getTestCaseConfig(caseName);
   const successRuns = runs.filter(run => run.ok && run.content);
   const timeoutRuns = runs.filter(run => run.timed_out);
@@ -962,7 +1103,7 @@ function summarizeCase(caseName: string, runs: EvaluationRun[]): EvaluationCaseS
   )).sort();
   const successRate = runs.length > 0 ? Number((successRuns.length / runs.length).toFixed(3)) : 0;
   const timeoutRate = runs.length > 0 ? Number((timeoutRuns.length / runs.length).toFixed(3)) : 0;
-  const caseEvaluation = evaluateCase(caseName, runs, texts, successRate);
+  const caseEvaluation = evaluateCase(caseName, runs, texts, successRate, model);
 
   const summary: EvaluationCaseSummary = {
     case: caseName,
@@ -1088,6 +1229,7 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
   }
 
   if (identity) {
+    const expectedModelMatch = identity.metrics.find(metric => metric.key === 'expected_model_match')?.value ?? 0;
     if (identity.score >= 85) {
       notes.push('身份信息返回较稳定');
     } else if (identity.score >= 70) {
@@ -1096,6 +1238,12 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
       risks.push(`身份验证明显偏低（当前 ${identity.score}），可能存在套壳或自报不实`);
     } else {
       risks.push(`身份一致性较弱（当前 ${identity.score}）`);
+    }
+
+    if (expectedModelMatch < 60) {
+      risks.push('自报模型名与配置模型标识不匹配');
+    } else if (expectedModelMatch < 85) {
+      risks.push('自报模型名与配置模型仅部分匹配');
     }
   }
 
@@ -1156,7 +1304,8 @@ function scoreModel(report: EvaluationCaseSummary[]): EvaluationScore {
 
 export async function evaluateModel(
   platform: Platform,
-  model: Model
+  model: Model,
+  control?: EvaluationControl
 ): Promise<ModelEvaluationReport> {
   const startedAt = Date.now();
   const allSummaries: EvaluationCaseSummary[] = [];
@@ -1167,18 +1316,21 @@ export async function evaluateModel(
   );
 
   for (const testCase of TEST_CASES) {
+    throwIfEvaluationCancelled(control);
     const runs: EvaluationRun[] = [];
     console.log(
       `[evaluation] case:start case="${testCase.name}" repeat=${testCase.repeat} timeout=${testCase.timeout}s`
     );
     for (let index = 0; index < testCase.repeat; index += 1) {
+      throwIfEvaluationCancelled(control);
       const result = await callModel(
         platform,
         model,
         testCase.name,
         testCase.input,
         testCase.timeout,
-        testCase.stream
+        testCase.stream,
+        control
       );
       runs.push(result);
 
@@ -1197,12 +1349,12 @@ export async function evaluateModel(
       }
 
       if (index < testCase.repeat - 1) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await waitWithCancellation(1000, control);
       }
     }
 
     rawLogs[testCase.name] = runs;
-    const caseSummary = summarizeCase(testCase.name, runs);
+    const caseSummary = summarizeCase(testCase.name, runs, model);
     allSummaries.push(caseSummary);
 
     console.log(
