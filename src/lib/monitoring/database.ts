@@ -97,6 +97,7 @@ function normalizeEvaluationRecord(row: Row): EvaluationRecord {
     metrics: Array.isArray(item.metrics) ? item.metrics : [],
     avg_ttft_s: typeof item.avg_ttft_s === 'number' ? item.avg_ttft_s : null,
     avg_total_time_s: typeof item.avg_total_time_s === 'number' ? item.avg_total_time_s : null,
+    avg_total_tokens: typeof item.avg_total_tokens === 'number' ? item.avg_total_tokens : null,
   }));
   const inferredRawScore = EVALUATION_CASE_ORDER.length > 0
     ? Math.round(EVALUATION_CASE_ORDER.reduce((sum, caseName) => {

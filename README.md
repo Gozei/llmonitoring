@@ -129,6 +129,16 @@ SQLITE_DATABASE_PATH=/data/llmmonitoring.db
 docker build -t llm-monitoring .
 ```
 
+如果当前网络环境访问 `docker.io` 比较慢，可以在构建时指定可访问的 Node 基础镜像源：
+
+```bash
+docker build \
+  --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:20-bookworm-slim \
+  -t llm-monitoring .
+```
+
+如果你本地已经提前拉好了某个 Node 20 基础镜像，也可以改成对应的镜像名。
+
 运行容器：
 
 ```bash

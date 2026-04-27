@@ -18,7 +18,17 @@ import {
 import { useStatus } from './use-api';
 import type { ModelStatus } from './types';
 
-type SortKey = 'score' | 'success_rate' | 'avg_latency' | 'latest_latency';
+const CASE_LABELS = {
+  connectivity_check: '连通性',
+  identity_check: '身份一致',
+  json_check: 'JSON 严格输出',
+  code_check: '代码能力',
+  reasoning_check: '长推理',
+  consistency_check: '同题稳定',
+} as const;
+
+type CaseSortKey = keyof typeof CASE_LABELS;
+type SortKey = 'score' | 'success_rate' | 'avg_latency' | 'latest_latency' | CaseSortKey;
 type SortOrder = 'asc' | 'desc';
 
 function formatPercent(value: number): string {
@@ -49,6 +59,10 @@ function getScoreValue(item: ModelStatus): number | null {
   return item.evaluation?.score ?? null;
 }
 
+function getCaseScoreValue(item: ModelStatus, caseName: CaseSortKey): number | null {
+  return item.evaluation?.summary.find(summary => summary.case === caseName)?.score ?? null;
+}
+
 function sortValue(item: ModelStatus, key: SortKey): number | null {
   switch (key) {
     case 'score':
@@ -60,7 +74,7 @@ function sortValue(item: ModelStatus, key: SortKey): number | null {
     case 'latest_latency':
       return getLatestLatencyValue(item);
     default:
-      return null;
+      return getCaseScoreValue(item, key);
   }
 }
 
@@ -87,7 +101,50 @@ const SORT_META: Record<SortKey, { label: string; lowerIsBetter?: boolean }> = {
   success_rate: { label: '成功率' },
   avg_latency: { label: '均值耗时', lowerIsBetter: true },
   latest_latency: { label: '实时耗时', lowerIsBetter: true },
+  connectivity_check: { label: CASE_LABELS.connectivity_check },
+  identity_check: { label: CASE_LABELS.identity_check },
+  json_check: { label: CASE_LABELS.json_check },
+  code_check: { label: CASE_LABELS.code_check },
+  reasoning_check: { label: CASE_LABELS.reasoning_check },
+  consistency_check: { label: CASE_LABELS.consistency_check },
 };
+
+const QUICK_SORT_KEYS: Array<Extract<SortKey, 'score' | 'success_rate' | 'avg_latency' | 'latest_latency'>> = [
+  'score',
+  'success_rate',
+  'avg_latency',
+  'latest_latency',
+];
+
+const CASE_SORT_KEYS = Object.keys(CASE_LABELS) as CaseSortKey[];
+
+function SortableHead({
+  label,
+  active,
+  order,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  order: SortOrder;
+  onClick: () => void;
+}) {
+  return (
+    <TableHead>
+      <button
+        type="button"
+        onClick={onClick}
+        className={`inline-flex items-center gap-1 whitespace-nowrap transition-colors hover:text-foreground ${
+          active ? 'text-foreground' : 'text-muted-foreground'
+        }`}
+      >
+        <span>{label}</span>
+        <ArrowDownUp className={`h-3.5 w-3.5 ${active ? 'opacity-100' : 'opacity-45'}`} />
+        {active && <span className="text-[10px]">{order === 'desc' ? '降' : '升'}</span>}
+      </button>
+    </TableHead>
+  );
+}
 
 export function RankingsBoard() {
   const { statuses, fetchStatus, loading, error } = useStatus();
@@ -103,6 +160,18 @@ export function RankingsBoard() {
   useEffect(() => {
     void loadStatus();
   }, [loadStatus]);
+
+  const updateSort = useCallback((nextKey: SortKey) => {
+    setSortKey((currentKey) => {
+      if (currentKey === nextKey) {
+        setSortOrder((currentOrder) => currentOrder === 'desc' ? 'asc' : 'desc');
+        return currentKey;
+      }
+
+      setSortOrder((SORT_META[nextKey].lowerIsBetter ?? false) ? 'asc' : 'desc');
+      return nextKey;
+    });
+  }, []);
 
   const sortedRows = useMemo(() => {
     const lowerIsBetter = SORT_META[sortKey].lowerIsBetter ?? false;
@@ -132,7 +201,7 @@ export function RankingsBoard() {
           </Link>
           <h1 className="mt-3 text-4xl font-semibold tracking-tight">评分榜</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            按最终评分、成功率、均值耗时、实时耗时切换排序，专门用来横向比较模型表现。
+            支持按最终评分、基础指标和 6 个子评估项单独排序，专门用来横向比较模型表现。
           </p>
         </div>
         <Button variant="outline" onClick={loadStatus} disabled={loading}>
@@ -146,7 +215,7 @@ export function RankingsBoard() {
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <CardTitle className="text-base">模型排行</CardTitle>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-              <Tabs value={sortKey} onValueChange={(value) => setSortKey(value as SortKey)}>
+              <Tabs value={QUICK_SORT_KEYS.includes(sortKey as typeof QUICK_SORT_KEYS[number]) ? sortKey : undefined} onValueChange={(value) => updateSort(value as SortKey)}>
                 <TabsList>
                   <TabsTrigger value="score"><TrendingUp className="h-4 w-4" />评分</TabsTrigger>
                   <TabsTrigger value="success_rate">成功率</TabsTrigger>
@@ -173,17 +242,26 @@ export function RankingsBoard() {
             </div>
           )}
         </CardHeader>
-        <CardContent>
-          <Table>
+        <CardContent className="overflow-x-auto">
+          <Table className="min-w-[1280px]">
             <TableHeader>
               <TableRow>
                 <TableHead>名次</TableHead>
                 <TableHead>模型</TableHead>
                 <TableHead>平台</TableHead>
-                <TableHead>评分</TableHead>
-                <TableHead>成功率</TableHead>
-                <TableHead>均值耗时</TableHead>
-                <TableHead>实时耗时</TableHead>
+                <SortableHead label="评分" active={sortKey === 'score'} order={sortOrder} onClick={() => updateSort('score')} />
+                <SortableHead label="成功率" active={sortKey === 'success_rate'} order={sortOrder} onClick={() => updateSort('success_rate')} />
+                <SortableHead label="均值耗时" active={sortKey === 'avg_latency'} order={sortOrder} onClick={() => updateSort('avg_latency')} />
+                <SortableHead label="实时耗时" active={sortKey === 'latest_latency'} order={sortOrder} onClick={() => updateSort('latest_latency')} />
+                {CASE_SORT_KEYS.map((caseKey) => (
+                  <SortableHead
+                    key={caseKey}
+                    label={CASE_LABELS[caseKey]}
+                    active={sortKey === caseKey}
+                    order={sortOrder}
+                    onClick={() => updateSort(caseKey)}
+                  />
+                ))}
                 <TableHead>最近评估</TableHead>
               </TableRow>
             </TableHeader>
@@ -212,6 +290,15 @@ export function RankingsBoard() {
                           ? '失败'
                           : '-'}
                   </TableCell>
+                  {CASE_SORT_KEYS.map((caseKey) => (
+                    <TableCell key={caseKey}>
+                      {item.evaluation ? (
+                        <span className={`inline-flex min-w-9 items-center justify-center rounded-md px-2 py-1 text-xs font-semibold ${scoreTone(getCaseScoreValue(item, caseKey))}`}>
+                          {getCaseScoreValue(item, caseKey) ?? '-'}
+                        </span>
+                      ) : '-'}
+                    </TableCell>
+                  ))}
                   <TableCell>
                     {item.evaluation?.created_at
                       ? new Date(item.evaluation.created_at).toLocaleString()

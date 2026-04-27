@@ -1,4 +1,6 @@
-FROM node:20-bookworm-slim AS builder
+ARG NODE_IMAGE=node:20-bookworm-slim
+
+FROM ${NODE_IMAGE} AS builder
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -22,7 +24,7 @@ RUN pnpm next build \
   && pnpm prune --prod
 
 
-FROM node:20-bookworm-slim AS runner
+FROM ${NODE_IMAGE} AS runner
 
 WORKDIR /app
 
@@ -36,7 +38,7 @@ RUN mkdir -p /data \
   && chown -R node:node /data
 
 COPY --from=builder --chown=node:node /app/package.json ./package.json
-COPY --from=builder --chown=node:node /app/next.config.ts ./next.config.ts
+COPY --from=builder --chown=node:node /app/next.config.mjs ./next.config.mjs
 COPY --from=builder --chown=node:node /app/public ./public
 COPY --from=builder --chown=node:node /app/.next ./.next
 COPY --from=builder --chown=node:node /app/dist ./dist

@@ -111,6 +111,11 @@ function caseScoreProgressTone(score: number): string {
   return 'bg-rose-100 [&_[data-slot=progress-indicator]]:bg-rose-500';
 }
 
+function formatTokens(value: number | null | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+  return `${Math.round(value).toLocaleString()} tokens`;
+}
+
 function CaseMetric({ item }: { item: EvaluationCaseSummary }) {
   const isReasoning = item.case === 'reasoning_check';
 
@@ -138,6 +143,10 @@ function CaseMetric({ item }: { item: EvaluationCaseSummary }) {
               <span className="shrink-0 font-medium text-foreground/80">{formatSeconds(item.avg_ttft_s)}</span>
             </div>
           )}
+          <div className="flex items-center justify-between gap-2">
+            <span className="truncate">平均 Token 消耗</span>
+            <span className="shrink-0 font-medium text-foreground/80">{formatTokens(item.avg_total_tokens)}</span>
+          </div>
           {item.metrics.slice(0, 3).map(metric => (
             <div key={metric.key} className="flex items-center justify-between gap-2">
               <span className="truncate">{metric.label}</span>

@@ -253,6 +253,48 @@ function roundTo(value: number, digits: number): number {
   return Number(value.toFixed(digits));
 }
 
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function extractUsageTotalTokens(usage: unknown): number | null {
+  if (!usage || typeof usage !== 'object') return null;
+
+  const record = usage as Record<string, unknown>;
+  const inputTokens = toFiniteNumber(record.input_tokens);
+  const outputTokens = toFiniteNumber(record.output_tokens);
+  const promptTokens = toFiniteNumber(record.prompt_tokens);
+  const completionTokens = toFiniteNumber(record.completion_tokens);
+  const promptTokensCamel = toFiniteNumber(record.promptTokens);
+  const completionTokensCamel = toFiniteNumber(record.completionTokens);
+  const candidates = [
+    toFiniteNumber(record.total_tokens),
+    toFiniteNumber(record.totalTokens),
+    inputTokens != null && outputTokens != null
+      ? inputTokens + outputTokens
+      : null,
+    promptTokens != null && completionTokens != null
+      ? promptTokens + completionTokens
+      : null,
+    promptTokensCamel != null && completionTokensCamel != null
+      ? promptTokensCamel + completionTokensCamel
+      : null,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 function toScore(value: number): number {
   return Math.round(clamp(value, 0, 1) * 100);
 }
@@ -1096,6 +1138,9 @@ function summarizeCase(caseName: string, runs: EvaluationRun[], model: Model): E
     .map(run => run.ttft_seconds)
     .filter((value): value is number => typeof value === 'number');
   const texts = successRuns.map(run => run.content).filter(Boolean);
+  const totalTokens = successRuns
+    .map(run => extractUsageTotalTokens(run.usage))
+    .filter((value): value is number => typeof value === 'number');
   const responseModels = Array.from(new Set(
     runs
       .map(run => run.response_model)
@@ -1120,6 +1165,7 @@ function summarizeCase(caseName: string, runs: EvaluationRun[], model: Model): E
     avg_total_time_s: config.latency_metric === 'total_time' && effectiveLatencies.length > 0
       ? roundTo(mean(effectiveLatencies), 3)
       : null,
+    avg_total_tokens: totalTokens.length > 0 ? Math.round(mean(totalTokens)) : null,
     min_latency_s: effectiveLatencies.length > 0 ? roundTo(Math.min(...effectiveLatencies), 3) : null,
     max_latency_s: effectiveLatencies.length > 0 ? roundTo(Math.max(...effectiveLatencies), 3) : null,
     response_models: responseModels,

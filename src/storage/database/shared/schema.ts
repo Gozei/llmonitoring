@@ -109,6 +109,7 @@ export interface EvaluationCaseSummary {
   avg_latency_s: number | null;
   avg_ttft_s: number | null;
   avg_total_time_s: number | null;
+  avg_total_tokens: number | null;
   min_latency_s: number | null;
   max_latency_s: number | null;
   response_models: string[];
